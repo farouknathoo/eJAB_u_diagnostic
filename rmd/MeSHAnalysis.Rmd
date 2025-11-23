@@ -1,0 +1,187 @@
+---
+title: "bayesfactorMeSH"
+output: html_document
+date: "2025-04-13"
+---
+
+```{r, include=FALSE}
+library(httr)
+library(readr)
+library(dplyr)
+```
+
+```{r}
+source("../CTGJAB.R", local = knitr::knit_global())
+```
+
+```{r}
+source("../rfuncs/EJABPVALUEPLOT.R", local = knitr::knit_global())
+source("../rfuncs/DirichletMultinomial.R", local = knitr::knit_global())
+source("../rfuncs/MeSH.R", local = knitr::knit_global())
+
+```
+
+
+```{r}
+# Step 1: Parse and clean unique MeSH IDs
+all_ids <- unlist(strsplit(study3_summary$conditionIds, ";\\s*"))
+unique_ids <- unique(all_ids[!is.na(all_ids)])
+
+# Step 3: Split into batches of 100 and query
+batches <- split(unique_ids, ceiling(seq_along(unique_ids) / 100))
+results_list <- lapply(batches, query_mesh_batch)
+
+# Step 4: Combine all batches
+mesh_df <- bind_rows(results_list)
+
+# Step 5: Clean URIs to extract ID and tree number codes
+mesh_df <- mesh_df %>%
+  mutate(
+    meshID = sub(".*/", "", meshID),
+    treeNumber = sub(".*/", "", treeNumber)
+  ) %>%
+  distinct()
+
+print(mesh_df)
+```
+
+```{r}
+mesh_df <- mesh_df %>%
+  mutate(treeNumber = sub("^([A-Z]\\d+).*", "\\1", treeNumber)) %>%
+  distinct()
+write_csv(mesh_df, "../csv/mesh_tree_numbers.csv")
+```
+
+```{r}
+study3_summary_expanded <- study3_summary %>%
+  # Split the conditionIds into separate rows
+  separate_rows(conditionIds, sep = ";") %>%
+  # Trim whitespace from conditionIds
+  mutate(conditionIds = str_trim(conditionIds)) %>%
+  # Remove any rows with NA in conditionIds or empty strings
+  filter(!is.na(conditionIds) & conditionIds != "") %>%
+  left_join(mesh_df, by = c("conditionIds" = "meshID"))
+```
+
+```{r}
+plot_data_per_tree <- function(data) {
+  unique_trees <- unique(data$treeNumber)
+  
+  plots <- lapply(unique_trees, function(tree) {
+    tree_data <- data[data$treeNumber == tree, ]
+    plot_data_summary(tree_data, tree)  # Call the abstracted function for each tree
+  })
+  
+  return(plots)  # Return a list of plots
+}
+
+# Generate the plots for each treeNumber
+tree_plots <- plot_data_per_tree(study3_summary_expanded)
+```
+```{r}
+library(gridExtra)
+library(ggplot2)  # in case your plots are ggplot objects
+
+# 9 plots per page, letter paper
+plots_per_page <- 9
+
+# Arrange plots into pages automatically
+pages <- marrangeGrob(
+  grobs = tree_plots,
+  ncol = 3, nrow = 3,       # 3x3 grid
+  top = NULL                # removes page titles
+)
+
+# Save to PDF in letter format
+ggsave(
+  "~/Downloads/ejabclinicaltrials/rmd/tree_plots.pdf",
+  pages,
+  width = 25, height = 15  # Letter size
+)
+```
+
+```{r}
+# Get proportional sample sizes and randomly select clinical trials
+sample_allocation <- study3_summary_expanded %>% 
+  distinct(nctId, .keep_all = TRUE) %>% 
+  count(treeNumber) %>% 
+  mutate(proportion = n / sum(n),
+         sample_size = round(proportion * 50)) %>%
+  arrange(desc(proportion))
+
+# Get random sample of clinical trials for each tree number
+stratified_sample <- study3_summary_expanded %>% 
+  distinct(nctId, .keep_all = TRUE) %>% 
+  left_join(sample_allocation %>% select(treeNumber, sample_size), by = "treeNumber") %>%
+  group_by(treeNumber) %>% 
+  mutate(rand = runif(n())) %>% 
+  arrange(rand) %>% 
+  filter(row_number() <= sample_size) %>% 
+  ungroup() %>%
+  select(-rand)
+
+print(stratified_sample$nctId)
+write.csv(stratified_sample$nctId, "stratified_sample.csv", row.names = FALSE)
+
+
+```
+
+```{r}
+library(knitr)
+library(kableExtra)
+
+# Mapping to categories
+category_map <- c(
+  "F01" = "Behavior & Behavior Mechanisms",
+  "C11" = "Eye Diseases",
+  "C04" = "Neoplasms",
+  "C09" = "Otorhinolaryngologic Diseases",
+  "E05" = "Investigative Techniques",
+  "C25" = "Chemically Induced Disorders",
+  "C26" = "Wounds and Injuries",
+  "C08" = "Respiratory Tract Diseases"
+)
+
+# Replace codes with category names
+df <- summary_dataframe_all_trees %>%
+  mutate(Category = category_map[treeNumber]) %>%
+  select(Category, everything(), -treeNumber) %>%
+  filter(analysisId_count >= 100) %>%
+  arrange(desc(posterior_mean)) %>%
+  slice_head(n = 8)
+
+# Generate the kable table
+df %>%
+  # Round numeric columns first
+  mutate(
+    posterior_mean = round(posterior_mean, 4),
+    posterior_se = round(posterior_se, 4)
+  ) %>%
+  kable(
+    col.names = c(
+      "MeSH Category",
+      "# of Trials", 
+      "# of Analyses",
+      "Posterior Mean",
+      "Posterior SE"
+    ),
+    caption = "Inconclusive or Contradictory eJAB Proportion",
+    format = "html"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+  ) %>%
+  column_spec(1, width = "5em") 
+```
+```{r}
+proportion_table <- study3_summary_expanded %>% 
+  distinct(nctId, .keep_all = TRUE) %>% 
+  count(treeNumber) %>% 
+  mutate(proportion = round((n / sum(n))*50)) %>%
+  arrange(desc(proportion))
+
+print(proportion_table)
+```
+
+

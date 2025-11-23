@@ -1,0 +1,531 @@
+---
+title: "Supplement Figures"
+output: html_document
+date: "2025-04-13"
+---
+```{r}
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+```
+
+```{r, include=FALSE}
+source("../CTGJAB.R", local = knitr::knit_global())
+```
+
+```{r}
+study3_summary2 <- study3_summary %>%
+  mutate(
+    Significant05 = if_else(pValue < 0.05 | ((pValue <= 0.05) & has_less_than == TRUE), "Significant", "Non-significant"),
+    Significant005 = if_else(pValue < 0.005 | ((pValue <= 0.005) & has_less_than == TRUE), "Significant", "Non-significant"),
+    BF_category = case_when(
+      JAB < 0.3 ~ "<0.3 (H1)",
+      JAB >= 0.3 & JAB < 3 ~ "0.3-3 (I)",
+      JAB >= 3 ~ ">3 (H0)"
+    ),
+    BF_category = factor(BF_category, levels = c("<0.3 (H1)", "0.3-3 (I)", ">3 (H0)"))
+  )
+
+# Create the contingency table
+contingency_table2 <- table(study3_summary2$Significant05, study3_summary2$BF_category)
+print(contingency_table2)
+```
+
+```{r}
+GeomSplitViolin <- ggproto("GeomSplitViolin", GeomViolin,
+  draw_group = function(data, ..., draw_quantiles = NULL) {
+    data <- transform(data,
+                      xminv = x - violinwidth * (x - xmin),
+                      xmaxv = x + violinwidth * (xmax - x))
+    grp <- data$group[1]
+    newdata <- data
+    if (grp %% 2 == 1) {
+      newdata$x <- data$xminv
+    } else {
+      newdata$x <- data$xmaxv
+    }
+    newdata <- newdata[order(newdata$y), ]
+    newdata <- rbind(newdata, newdata[1, ])
+    ggplot2:::GeomPolygon$draw_panel(newdata, ...)
+  }
+)
+
+geom_split_violin <- function(mapping = NULL, data = NULL,
+                                stat = "ydensity", position = "identity",
+                                ..., draw_quantiles = NULL,
+                                trim = TRUE, scale = "area", na.rm = FALSE,
+                                show.legend = FALSE, inherit.aes = TRUE) {
+  layer(
+    data = data,
+    mapping = mapping,
+    stat = stat,
+    geom = GeomSplitViolin,
+    position = position,
+    show.legend = show.legend,
+    inherit.aes = inherit.aes,
+    params = list(
+      trim = trim,
+      scale = scale,
+      na.rm = na.rm,
+      draw_quantiles = draw_quantiles,
+      ...
+    )
+  )
+}
+```
+
+
+# JLP Cases
+
+```{r}
+library(writexl)
+JLPCases = study3_summary %>% filter(JAB >= 1, pValue <= 0.005)
+write_xlsx(JLPCases, "../csv/JLPCases2.xlsx")
+```
+
+
+
+```{r}
+counts_labels <- study3_summary2 %>%
+  filter(!is.na(BF_category)) %>%  # Drop rows where BF_category is NA
+  group_by(Significant05, BF_category) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  complete(Significant05, BF_category, fill = list(Count = 0))
+
+# -----------------------------------
+# 2. Determine y positions for BF category count labels
+# -----------------------------------
+annotation_positions <- data.frame(
+  BF_category = c("<0.3 (H1)", "0.3-3 (I)", ">3 (H0)"),
+  ypos = c(( -7.5 + log(1/3)) / 2,
+           (log(1/3) + log(3)) / 2,
+           (log(3) + 7.5) / 2)
+)
+
+counts_labels <- left_join(counts_labels, annotation_positions, by = "BF_category") %>%
+  mutate(xpos = if_else(Significant05 == "Significant", 1.3, 0.7))
+
+# -----------------------------------
+# 3. Compute top labels for each significance group (from counts_labels)
+# -----------------------------------
+sig_totals <- counts_labels %>%
+  group_by(Significant05) %>%
+  summarise(total = sum(Count), .groups = "drop") %>%
+  mutate(
+    xpos = if_else(Significant05 == "Significant", 1.3, 0.7),
+    label = paste0(Significant05, " (", total, ")"),
+    ypos = 7.5 - 0.5
+  )
+
+# -----------------------------------
+# 4. Build the plot
+# -----------------------------------
+p <- ggplot(study3_summary2, aes(x = factor(1), y = log(JAB), fill = Significant05)) +
+  geom_split_violin(trim = FALSE) +
+  # Add horizontal dashed lines at log(1/3) and log(3)
+  geom_hline(yintercept = c(log(1/3), log(3)), linetype = "dashed", color = "black") +
+  # Annotate BF category counts for each significance group
+  geom_text(data = counts_labels, aes(x = xpos, y = ypos, label = Count), size = 4) +
+  # Annotate top significance totals on each side of the violin
+  geom_text(data = sig_totals, aes(x = xpos, y = ypos, label = label), size = 4, fontface = "bold") +
+  # Label the three vertical sections of the plot:
+  annotate("text", x = 1.5, y = (7.5 + log(3)) / 2, label = "evidence for H0", 
+           size = 3, fontface = "italic", color = "blue") +
+  annotate("text", x = 1.5, y = (log(3) + log(1/3)) / 2, label = "inconclusive", 
+           size = 3, fontface = "italic", color = "black") +
+  annotate("text", x = 1.5, y = (-7.5 + log(1/3)) / 2, label = "evidence for H1", 
+           size = 3, fontface = "italic", color = "red") +
+  labs(x = "", y = "log(JAB)") +
+  scale_y_continuous(limits = c(-7.5, 7.5)) +
+ggtitle(
+  bquote("Significance ("*alpha*" = 0.05) vs Evidence for EJAB Hypothesis – STUDY III")
+) +  theme_minimal()
+
+print(p)
+```
+
+
+```{r}
+counts_labels <- study3_summary2 %>%
+  group_by(Significant005, BF_category) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  complete(Significant005, BF_category, fill = list(Count = 0))
+
+# -----------------------------------
+# 2. Determine y positions for BF category count labels
+# -----------------------------------
+annotation_positions <- data.frame(
+  BF_category = c("<0.3 (H1)", "0.3-3 (I)", ">3 (H0)"),
+  ypos = c(( -7.5 + log(1/3)) / 2,
+           (log(1/3) + log(3)) / 2,
+           (log(3) + 7.5) / 2)
+)
+
+counts_labels <- left_join(counts_labels, annotation_positions, by = "BF_category") %>%
+  mutate(xpos = if_else(Significant005 == "Significant", 1.3, 0.7))
+
+# -----------------------------------
+# 3. Compute top labels for each significance group (from counts_labels)
+# -----------------------------------
+sig_totals <- counts_labels %>%
+  group_by(Significant005) %>%
+  summarise(total = sum(Count), .groups = "drop") %>%
+  mutate(
+    xpos = if_else(Significant005 == "Significant", 1.3, 0.7),
+    label = paste0(Significant005, " (", total, ")"),
+    ypos = 7.5 - 0.5
+  )
+
+# -----------------------------------
+# 4. Build the plot
+# -----------------------------------
+p <- ggplot(study3_summary2, aes(x = factor(1), y = log(JAB), fill = Significant005)) +
+  geom_split_violin(trim = FALSE) +
+  # Add horizontal dashed lines at log(1/3) and log(3)
+  geom_hline(yintercept = c(log(1/3), log(3)), linetype = "dashed", color = "black") +
+  # Annotate BF category counts for each significance group
+  geom_text(data = counts_labels, aes(x = xpos, y = ypos, label = Count), size = 4) +
+  # Annotate top significance totals on each side of the violin
+  geom_text(data = sig_totals, aes(x = xpos, y = ypos, label = label), size = 4, fontface = "bold") +
+  # Label the three vertical sections of the plot:
+  annotate("text", x = 1.5, y = (7.5 + log(3)) / 2, label = "evidence for H0", 
+           size = 3, fontface = "italic", color = "blue") +
+  annotate("text", x = 1.5, y = (log(3) + log(1/3)) / 2, label = "inconclusive", 
+           size = 3, fontface = "italic", color = "black") +
+  annotate("text", x = 1.5, y = (-7.5 + log(1/3)) / 2, label = "evidence for H1", 
+           size = 3, fontface = "italic", color = "red") +
+  labs(x = "", y = "log(JAB)") +
+  scale_y_continuous(limits = c(-7.5, 7.5)) +
+ggtitle(
+  bquote("Significance ("*alpha*" = 0.005) vs Evidence for EJAB Hypothesis – STUDY III")
+) +  theme_minimal()
+
+print(p)
+```
+
+```{r}
+# Step 1: Filter out NAs and pValues exactly equal to 0.05
+filtered_df <- study3_summary2 %>%
+  filter(has_less_than == FALSE, pValue != 0.05)
+
+# Step 2: Define fine alpha grid
+alphas_fine <- seq(0.001, 1, length.out = 1000)
+
+# Step 3: Compute proportions over fine grid, by statisticalMethod
+proportion_data <- filtered_df %>%
+  group_by(statisticalMethod) %>%
+  do({
+    data.frame(
+      alpha = alphas_fine,
+      proportion = sapply(alphas_fine, function(a) {
+        mean(.$JAB > 1 & .$pValue < a)
+      })
+    )
+  }) %>%
+  ungroup()
+
+# Step 4: Downsample for main plot (100 points evenly spaced)
+alphas_main <- seq(0.01, 1, length.out = 100)
+plot_main_data <- proportion_data %>% filter(alpha %in% alphas_main)
+
+# Step 5: Create main plot (overlay by statisticalMethod)
+main_plot <- ggplot(plot_main_data, aes(x = alpha, y = proportion, color = statisticalMethod)) +
+  geom_line(size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "black") +
+  labs(
+    title = "Proportion of Studies with JAB > 1 and p < \u03B1",
+    x = expression(alpha),
+    y = "Observed Proportion",
+    color = "Statistical Method"
+  ) +
+  theme_minimal()
+
+
+# Step 7: Combine with inset
+alpha_plot <- ggdraw() +
+  draw_plot(main_plot) 
+# Step 8: Display
+print(alpha_plot)
+```
+
+
+
+```{r}
+# Parameters -------------------------------------------------
+set.seed(20250422)
+sims_total   <- 1000
+alpha        <- 0.05
+prop_h0      <- 0.3
+sample_sizes <- seq(50, 1000, by = 50)
+deltas       <- c(0.2, 0.5, 0.8)
+
+# Helper: simulate one two-sample trial ----------------------
+simulate_two_sample <- function(mu_treat, n) {
+  x <- rnorm(n, mean = mu_treat, sd = 1)
+  y <- rnorm(n, mean = 0, sd = 1)
+  list(x = x, y = y)
+}
+
+# Outer loop over delta --------------------------------------
+metrics_tbl <- map_dfr(deltas, function(delta) {
+
+  map_dfr(sample_sizes, function(sample_size) {
+
+    n_h0 <- round(sims_total * prop_h0)
+    n_h1 <- sims_total - n_h0
+
+    sims <- map(seq_len(sims_total), function(idx) {
+
+      group <- if (idx <= n_h0) "H0" else "H1"
+      mu    <- if (group == "H0") 0 else delta
+      data  <- simulate_two_sample(mu, sample_size)
+
+      pval <- t.test(data$x, data$y, var.equal = TRUE)$p.value
+      bf01 <- JAB01(sample_size*2, pval, "t-test")
+      flag  <- (pval < alpha) & (bf01 > 1)   # for Type I detection
+      flagII <- (pval > alpha) & (bf01 < 3)  # for Type II detection
+
+      tibble(
+        group = group,
+        flag = flag,
+        flagII = flagII,
+        actual_typeI = (group == "H0" & pval < alpha),
+        actual_typeII = (group == "H1" & pval >= alpha)
+      )
+    })
+
+    df <- bind_rows(sims)
+
+    # Type I error detection
+    TP_I <- sum(df$flag &  df$actual_typeI)
+    FP_I <- sum(df$flag & !df$actual_typeI)
+
+    Precision_I <- ifelse(TP_I + FP_I == 0, NA, TP_I / (TP_I + FP_I))
+
+    # Type II error detection
+    TP_II <- sum(df$flagII &  df$actual_typeII)
+    FP_II <- sum(df$flagII & !df$actual_typeII)
+
+    Precision_II <- ifelse(TP_II + FP_II == 0, NA, TP_II / (TP_II + FP_II))
+
+    tibble(
+      delta        = delta,
+      sample_size  = sample_size,
+      Precision_I  = Precision_I,
+      Precision_II = Precision_II
+    )
+  })
+})
+
+```
+
+```{r}
+# Plot --------------------------------------------------------
+# Reshape metrics to long format
+metrics_long <- metrics_tbl %>%
+  pivot_longer(cols = c(Precision_I, Precision_II),
+               names_to = "errortype",
+               values_to = "value") %>%
+  mutate(
+    errortype = recode(errortype,
+                       Precision_I = "Type I",
+                       Precision_II = "Type II")
+  )
+
+# Plot
+ggplot(metrics_long,
+       aes(x = sample_size, y = value, colour = errortype)) +
+  geom_line(size = 1.1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = sample_sizes*5) +  # small fix here too
+  facet_wrap(~ delta, labeller = label_bquote(delta == .(delta))) +
+  labs(title   = "JLP Diagnostic Precision vs. Sample Size (two-sample t-test, H0 prop. = 0.3)",
+       x       = "Sample Size",
+       y       = "Precision",
+       colour  = "Error Type") +
+  theme_minimal(base_size = 13) +
+  coord_cartesian(ylim = c(0, 1))
+
+```
+
+
+```{r}
+# Parameters -------------------------------------------------
+set.seed(20250422)
+sims_total   <- 1000
+n_per_group  <- 30
+alpha        <- 0.05
+h0_props     <- seq(0, 1, by = 0.2)
+deltas       <- c(0.2, 0.5, 0.8)   # multiple effect sizes
+
+# Helper: simulate one two-sample trial ----------------------
+simulate_two_sample <- function(mu_treat, n) {
+  x <- rnorm(n, mean = mu_treat, sd = 1)
+  y <- rnorm(n, mean = 0, sd = 1)
+  list(x = x, y = y)
+}
+
+# Outer loop over delta --------------------------------------
+metrics_tbl <- map_dfr(deltas, function(delta) {
+
+  map_dfr(h0_props, function(prop_h0) {
+
+    n_h0 <- round(sims_total * prop_h0)
+    n_h1 <- sims_total - n_h0
+
+    sims <- map(seq_len(sims_total), function(idx) {
+
+      group <- if (idx <= n_h0) "H0" else "H1"
+      mu    <- if (group == "H0") 0 else delta
+      data  <- simulate_two_sample(mu, n_per_group)
+
+      # Frequentist p-value
+      pval <- t.test(data$x, data$y, var.equal = TRUE)$p.value
+
+      # Bayes factor BF01 (evidence for H0)
+      bf01 <- JAB01(n_per_group*2, pval, "t-test")
+
+      # Jeffreys–Lindley flag
+      flag <- (pval < alpha) & (bf01 > 1)
+
+      tibble(group,
+             flag,
+             actual_typeI = (group == "H0" & pval < alpha))
+    })
+
+    df <- bind_rows(sims)
+
+    TP <- sum(df$flag &  df$actual_typeI)
+    FP <- sum(df$flag & !df$actual_typeI)
+    FN <- sum(!df$flag &  df$actual_typeI)
+    TN <- sum(!df$flag & !df$actual_typeI)
+
+    acc  <- (TP + TN) / (TP + FP + FN + TN)
+    prec <- ifelse(TP + FP == 0, NA, TP / (TP + FP))
+    rec  <- ifelse(TP + FN == 0, NA, TP / (TP + FN))
+    f1   <- ifelse(is.na(prec) | is.na(rec) | (prec + rec == 0),
+                   NA, 2 * prec * rec / (prec + rec))
+
+    tibble(
+      delta    = delta,
+      prop_h0  = prop_h0,
+      TP       = TP,
+      FP       = FP,
+      FN       = FN,
+      TN       = TN,
+      Accuracy = acc,
+      Precision = prec,
+      Recall    = rec,
+      F1        = f1
+    )
+  })
+})
+
+# Plot --------------------------------------------------------
+metrics_long <- metrics_tbl %>%
+  pivot_longer(cols = c("Accuracy", "Precision", "Recall", "F1"),
+               names_to = "metric", values_to = "value")
+
+ggplot(metrics_long,
+       aes(x = prop_h0, y = value, colour = metric)) +
+  geom_line(size = 1.1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = h0_props) +
+  facet_wrap(~ delta, labeller = label_bquote(delta == .(delta))) +
+  labs(title   = "JLP Diagnostic vs. H0 Proportion (two-sample t-test)",
+       x       = "Proportion of datasets drawn from H0",
+       y       = "Metric value",
+       colour  = NULL) +
+  theme_minimal(base_size = 13) +
+  coord_cartesian(ylim = c(0, 1))
+```
+
+
+# File Drawer Effect 
+
+```{r}
+study3_labeled <- study3_clean %>%
+  mutate(Significant = pValue < 0.05)
+
+# Step 2: Count distinct NCTIDs by hasResultsOrDerived and significance
+nctid_table <- study3_labeled %>%
+  group_by(hasResultsOrDerived, Significant) %>%
+  summarise(nctId_count = n_distinct(nctId), .groups = "drop")
+
+# Step 3: Pivot to 2x2 table format
+library(tidyr)
+
+nctid_cont <- nctid_table %>%
+  pivot_wider(names_from = Significant, values_from = nctId_count, values_fill = 0) %>%
+  rename(`Non-significant (p ≥ 0.05)` = `FALSE`,
+         `Significant (p < 0.05)` = `TRUE`)
+
+# View 2x2 table
+print(nctid_cont)
+```
+
+```{r}
+# Perform KW
+kw_result <- kruskal.test(log(pValue) ~ Phase, data = df_long)
+p_value <- kw_result$p.value
+p_text <- ifelse(p_value < 0.001, "p < 0.001", paste("p =", round(p_value, 3)))
+
+ggplot(df_long, aes(x = pValue, y = Phase, fill = Phase)) +
+  geom_density_ridges(
+    aes(height = ..density..),
+    stat = "density",
+    scale = 1,
+    rel_min_height = 0,
+    alpha = 0.7,
+    color = "black"
+  ) +
+  geom_vline(xintercept = 0.05, linetype = "dashed", color = "red", size = 1) +
+  annotate("text", x = 0.06, y = 0.7, label = "α = 0.05", color = "red", size = 4.5, hjust = 0) +
+  labs(title = "Distribution of pValues by Phase",
+       x = "pValue", y = "Phase") + theme_minimal() + theme(legend.position = "none") + 
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 10),
+    plot.title = element_text(size = 20)  # Increase the title size here
+  )
+```
+
+```{r}
+# Perform KW
+kw_result <- kruskal.test(log(N) ~ Phase, data = df_long)
+p_value <- kw_result$p.value
+p_text <- ifelse(p_value < 0.001, "p < 0.001", paste("p =", round(p_value, 3)))
+
+nice_Ns <- c(20, 200, 2000, 20000)
+
+samplesize <- ggplot(df_long, aes(x = log(N), y = Phase, fill = Phase)) +
+  geom_density_ridges(
+    aes(height = ..density..),
+    stat = "density",
+    scale = 1,
+    rel_min_height = 0,
+    alpha = 0.7,
+    color = "black"
+  ) +
+  scale_x_continuous(
+    breaks = log(nice_Ns),
+    labels = nice_Ns,
+    name = "Sample Size"
+  ) +
+  labs(
+    title = "Distribution of Sample Size by Phase",
+    y = "Phase"
+  ) +
+  theme_minimal() + 
+  theme(legend.position = "none")  + 
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 10),
+    plot.title = element_text(size = 20)  # Increase the title size here
+  )
+
+samplesize
+```
+
+
+
