@@ -1,0 +1,37 @@
+"If we remove cases, 
+we want to remove them starting with smallest B(u). 
+We just want to remove them one-by-one 
+or by small groups until the qqplot 
+become approximately linear.  
+Then we would say the remaining set 
+is our final set of candidate type 
+I errors because there is a p-value/eJAB 
+conflict, and the corresponding observed 
+value of u behaves as it should for a 
+type I error."
+
+
+
+"1. At level \alpha, look for NHST/Bayes conflict 
+(we happen to use eJAB so we need only the sample 
+size and p-value; more generally a Bayes factor 
+based on a possibly different prior and computation 
+is used); 
+
+2. Compute u and B(u) for the initial set of 
+candidate type I errors; 
+
+3. Make the qqplot. If it looks uniform stop
+and output: the list of candidate type I errors, 
+p-value, eJAB (or BF), B(u). Otherwise it 
+(the remaining sample of u's) should correspond 
+to a right skewed distribution. 
+
+4. Remove (k>=1) cases according to the min Bayes factor B(u)."
+
+Iterate 3 & 4    
+
+
+
+
+
