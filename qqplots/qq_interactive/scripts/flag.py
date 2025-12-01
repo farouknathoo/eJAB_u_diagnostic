@@ -24,7 +24,7 @@ def flag_candidates(
             f"Input file {input_path} must contain 'p_value' and 'ejab_value' columns."
         )
 
-    mask = (df["p_value"] <= alpha) & (df["ejab_value"] > 1.0)
+    mask = (df["p_value"] < alpha) & (df["ejab_value"] > 1.0)
     flagged = df.loc[mask].copy()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
