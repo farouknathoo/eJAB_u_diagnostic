@@ -1,0 +1,247 @@
+---
+title: "Simulation: eJAB vs AIC vs BIC for Model Selection"
+output: html_document
+date: "2025-02-18"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(42)
+```
+
+## Goal
+
+Compare **eJAB**, **AIC**, and **BIC** in a model-selection simulation across two
+scenarios: (A) selecting the correct model when the true model has two
+predictors, and (B) avoiding overfitting when extra noise predictors are
+available.
+
+## eJAB function (from RPP)
+
+```{r ejab-def}
+ejab01 <- function(p, n, q) {
+  stopifnot(all(p > 0 & p < 1), all(n > 1), all(q >= 1))
+  chi_quant <- qchisq(1 - p, df = q)
+  sqrt(n) * exp(-0.5 * (n^(1/q) - 1) / n^(1/q) * chi_quant)
+}
+```
+
+**Interpretation refresher**: eJAB is a Bayes-factor-like quantity measuring
+evidence *for the null*.
+
+- **Small eJAB** (< 1) = strong evidence the alternative (larger model) is real.
+- **Large eJAB** (> 1) = the null / simpler model is favored.
+
+In the RPP pipeline, `ejab > C*` flags suspected Type I errors — studies where
+the p-value looks significant but the Bayes factor actually favors the null.
+
+## Helpers
+
+```{r helpers}
+clamp_p <- function(p) pmax(pmin(p, 1 - 1e-15), 1e-15)
+
+generate_data <- function(n, betas, sigma = 1, n_noise = 0) {
+  k <- length(betas) - 1
+  X <- matrix(rnorm(n * (k + n_noise)), n, k + n_noise)
+  colnames(X) <- paste0("x", seq_len(k + n_noise))
+  y <- X[, seq_len(k), drop = FALSE] %*% betas[-1] + betas[1] + rnorm(n, 0, sigma)
+  data.frame(y = as.numeric(y), X)
+}
+```
+
+## Scenario A — True model with 2 predictors
+
+**True model**: $y = 0.3 x_1 + 0.3 x_2 + \varepsilon$.
+Candidates: null, $x_1$, $x_2$, $x_1 + x_2$.
+
+```{r scenario-a-functions}
+fit_A <- function(d) {
+  list(
+    null = lm(y ~ 1,      data = d),
+    M1   = lm(y ~ x1,     data = d),
+    M2   = lm(y ~ x2,     data = d),
+    M12  = lm(y ~ x1+x2,  data = d)
+  )
+}
+
+select_aic <- function(fits) which.min(sapply(fits, AIC))
+select_bic <- function(fits) which.min(sapply(fits, BIC))
+
+# eJAB: compare each non-null model to null; select the one with the smallest
+# eJAB (strongest evidence against null).  If all eJAB >= 1, select null.
+select_ejab <- function(fits, n) {
+  null_fit <- fits[["null"]]
+  non_null <- fits[names(fits) != "null"]
+  qs <- sapply(non_null, function(f) length(coef(f)) - length(coef(null_fit)))
+
+  pvals <- sapply(non_null, function(f) {
+    clamp_p(anova(null_fit, f)$`Pr(>F)`[2])
+  })
+
+  ejabs <- mapply(ejab01, p = pvals, n = n, q = qs)
+  if (all(ejabs >= 1)) return(1L)
+  1L + which.min(ejabs)
+}
+
+model_names_A <- c("null", "M1", "M2", "M12")
+true_idx_A    <- 4L
+```
+
+```{r run-a}
+n_sims  <- 500
+n_vec   <- c(25, 50, 100, 200)
+res_A   <- list()
+
+for (nn in n_vec) {
+  counts <- matrix(0L, nrow = 4, ncol = 3,
+                   dimnames = list(model_names_A, c("AIC", "BIC", "eJAB")))
+  for (i in seq_len(n_sims)) {
+    d    <- generate_data(nn, betas = c(0, 0.3, 0.3))
+    fits <- fit_A(d)
+    counts[select_aic(fits),         "AIC"]  <- counts[select_aic(fits),  "AIC"]  + 1L
+    counts[select_bic(fits),         "BIC"]  <- counts[select_bic(fits),  "BIC"]  + 1L
+    counts[select_ejab(fits, nn),    "eJAB"] <- counts[select_ejab(fits, nn), "eJAB"] + 1L
+  }
+  res_A[[as.character(nn)]] <- counts
+}
+```
+
+### Correct-selection rate (true model = M12)
+
+```{r table-a}
+tab_A <- do.call(rbind, lapply(names(res_A), function(nn) {
+  m <- res_A[[nn]]
+  data.frame(
+    n    = as.integer(nn),
+    AIC  = sprintf("%.1f%%", 100 * m["M12","AIC"]  / n_sims),
+    BIC  = sprintf("%.1f%%", 100 * m["M12","BIC"]  / n_sims),
+    eJAB = sprintf("%.1f%%", 100 * m["M12","eJAB"] / n_sims)
+  )
+}))
+knitr::kable(tab_A, align = "r",
+             caption = "Scenario A — % selecting true model (M12) out of 500 sims")
+```
+
+### Full choice distributions
+
+```{r choices-a}
+for (nn in names(res_A)) {
+  cat("\n### n =", nn, "\n")
+  print(res_A[[nn]])
+}
+```
+
+## Scenario B — Overfitting test (true model = null)
+
+**True model**: $y = \varepsilon$ (no signal). Five candidate predictors are all
+noise. This tests whether each criterion correctly favors the null.
+
+```{r scenario-b}
+fit_B <- function(d) {
+  list(
+    null = lm(y ~ 1, data = d),
+    M1   = lm(y ~ x1, data = d),
+    M2   = lm(y ~ x1+x2, data = d),
+    M3   = lm(y ~ x1+x2+x3, data = d),
+    M4   = lm(y ~ x1+x2+x3+x4, data = d),
+    M5   = lm(y ~ x1+x2+x3+x4+x5, data = d)
+  )
+}
+
+select_ejab_B <- function(fits, n) {
+  null_fit <- fits[["null"]]
+  non_null <- fits[names(fits) != "null"]
+  qs <- sapply(non_null, function(f) length(coef(f)) - length(coef(null_fit)))
+  pvals <- sapply(non_null, function(f) clamp_p(anova(null_fit, f)$`Pr(>F)`[2]))
+  ejabs <- mapply(ejab01, p = pvals, n = n, q = qs)
+  if (all(ejabs >= 1)) return(1L)
+  1L + which.min(ejabs)
+}
+
+model_names_B <- c("null", paste0("M", 1:5))
+
+res_B <- list()
+for (nn in n_vec) {
+  aic_c <- bic_c <- ejab_c <- setNames(integer(6), model_names_B)
+  for (i in seq_len(n_sims)) {
+    d    <- generate_data(nn, betas = c(0, rep(0, 5)), n_noise = 0)
+    fits <- fit_B(d)
+    a <- select_aic(fits);           aic_c[a]  <- aic_c[a]  + 1L
+    b <- select_bic(fits);           bic_c[b]  <- bic_c[b]  + 1L
+    e <- select_ejab_B(fits, nn);    ejab_c[e] <- ejab_c[e] + 1L
+  }
+  res_B[[as.character(nn)]] <- list(AIC = aic_c, BIC = bic_c, eJAB = ejab_c)
+}
+```
+
+### Null-selection rate (true model = null, no signal)
+
+```{r table-b}
+tab_B <- do.call(rbind, lapply(names(res_B), function(nn) {
+  r <- res_B[[nn]]
+  data.frame(
+    n     = as.integer(nn),
+    AIC   = sprintf("%.1f%%", 100 * r$AIC["null"] / n_sims),
+    BIC   = sprintf("%.1f%%", 100 * r$BIC["null"] / n_sims),
+    eJAB  = sprintf("%.1f%%", 100 * r$eJAB["null"] / n_sims)
+  )
+}))
+knitr::kable(tab_B, align = "r",
+             caption = "Scenario B — % correctly selecting null (no signal) out of 500 sims")
+```
+
+### Full choice distributions
+
+```{r choices-b}
+for (nn in names(res_B)) {
+  r <- res_B[[nn]]
+  cat("\n### n =", nn, "\n")
+  cat("AIC:  ", paste(model_names_B, r$AIC,  sep="=", collapse=", "), "\n")
+  cat("BIC:  ", paste(model_names_B, r$BIC,  sep="=", collapse=", "), "\n")
+  cat("eJAB: ", paste(model_names_B, r$eJAB, sep="=", collapse=", "), "\n")
+}
+```
+
+## Summary
+
+```{r summary-plot, fig.width = 9, fig.height = 4}
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+# Panel A — correct selection (true model has signal)
+pct_A <- sapply(res_A, function(m) {
+  c(AIC = m["M12","AIC"], BIC = m["M12","BIC"],
+    eJAB = m["M12","eJAB"]) / n_sims * 100
+})
+colnames(pct_A) <- n_vec
+barplot(pct_A, beside = TRUE, ylim = c(0, 100),
+        col = c("steelblue","coral","seagreen"),
+        xlab = "n", ylab = "% correct",
+        main = "A: True model selection (M12)")
+legend("topleft", rownames(pct_A), fill = c("steelblue","coral","seagreen"),
+       cex = 0.75, bty = "n")
+
+# Panel B — null retention (no signal)
+pct_B <- sapply(res_B, function(r) {
+  c(AIC = r$AIC["null"], BIC = r$BIC["null"], eJAB = r$eJAB["null"]) / n_sims * 100
+})
+colnames(pct_B) <- n_vec
+barplot(pct_B, beside = TRUE, ylim = c(0, 100),
+        col = c("steelblue","coral","seagreen"),
+        xlab = "n", ylab = "% selecting null",
+        main = "B: Null retention (no signal)")
+legend("topleft", rownames(pct_B), fill = c("steelblue","coral","seagreen"),
+       cex = 0.75, bty = "n")
+```
+
+### Take-aways
+
+- **AIC** is aggressive — good at finding the true model when signal exists, but
+  prone to overfitting noise predictors (Scenario B).
+- **BIC** adds a stronger penalty ($\log n$) and resists overfitting better, at
+  the cost of lower power in small samples.
+- **eJAB** acts as a Bayes-factor filter: it selects the model only when evidence
+  is decisive (eJAB < 1 against the null). This makes it conservative — it may
+  under-select in small $n$, but it strongly resists overfitting, similar to or
+  better than BIC.
+
+Adjust `betas` and `sigma` to explore different signal-to-noise regimes.

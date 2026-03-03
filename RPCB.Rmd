@@ -1,0 +1,777 @@
+---
+title: "RPCB"
+output: html_document
+date: "2025-12-12"
+---
+
+```{r}
+library(dplyr)
+library(readr)
+```
+
+```{r}
+alpha = 0.05
+```
+
+```{r setup, include=FALSE}
+rpcb = read.csv("RP_CB Final Analysis - Effect level data.csv")
+rpcb_df = rpcb[, c("Paper..", "Original.sample.size", "Original.p.value",
+                    "Replication.p.value", "Original.test.statistic.type",
+                    "Original.df1", "Original.df2")]
+rpcb_df = rpcb_df[!is.na(rpcb_df$Original.p.value) &
+                   !is.na(rpcb_df$Original.sample.size) &
+                   !is.na(rpcb_df$Replication.p.value), ]
+rpcb_df$replicated = ifelse(rpcb_df$Replication.p.value < alpha, 1, 0)
+```
+
+Core eJAB functions
+```{r}
+# EJAB01
+ejab01 <- function(p, n, q) {
+  stopifnot(all(p > 0 & p < 1), all(n > 1), all(q >= 1))
+  
+  chi_quant <- qchisq(1 - p, df = q)
+  sqrt(n) * exp(-0.5 * (n^(1/q) - 1) / n^(1/q) * chi_quant)
+}
+
+# Type 1 identifier
+detect_type1 <- function(p, ejab, alpha, Cstar) {
+  which(p < alpha & ejab > Cstar)
+}
+
+# Diagnostic U_i
+diagnostic_U <- function(p, n, q, alpha, Cstar) {
+  d <- 1 - pchisq(
+    (2 * n^(1/q) / (n^(1/q) - 1)) * log(sqrt(n) / Cstar),
+    df = q
+  )
+  (p - d) / (alpha - d)
+}
+```
+
+Adaptive C*(alpha) calibration (from calibration_new.R)
+```{r}
+# Estimate a separate C*(alpha) for each alpha on a grid in (0, up].
+# At each alpha, C*(alpha) minimises (observed_proportion - alpha/up)^2
+# where proportion = count(p <= alpha AND ejab > C) / count(p < up).
+estimate_Cstar_alpha <- function(p, ejab, up = 0.1,
+                                  grid_range = c(0, 1), grid_n = 200,
+                                  n_alpha = 200) {
+  alpha_grid <- seq(0, up, length.out = n_alpha + 1)[-1]
+  C_grid     <- seq(grid_range[1], grid_range[2], length.out = grid_n)
+  N          <- sum(p < up)
+
+  Cstar_alpha <- numeric(length(alpha_grid))
+  proportions <- numeric(length(alpha_grid))
+
+  for (i in seq_along(alpha_grid)) {
+    a      <- alpha_grid[i]
+    target <- a / up
+    props  <- vapply(C_grid, function(C) sum(p < a & ejab > C) / N, numeric(1))
+    best   <- which.min((props - target)^2)
+    Cstar_alpha[i] <- C_grid[best]
+    proportions[i] <- props[best]
+  }
+
+  list(alpha_grid = alpha_grid,
+       Cstar_alpha = Cstar_alpha,
+       proportions = proportions)
+}
+
+# Diagnostic QQ-plot with OLS best-fit line and MC-calibrated
+# simultaneous confidence band (adapted from calibration_new.R).
+diagnostic_qqplot_fit <- function(U, alpha = NULL, Cstar = NULL,
+                                   band = TRUE, conf = 0.95,
+                                   B = 10000, seed = 1, ...) {
+  n <- length(U)
+  if (n == 0) {
+    message("No candidate T1Es detected; cannot produce QQ-plot.")
+    return(invisible(NULL))
+  }
+
+  theoretical <- stats::ppoints(n)
+  observed    <- sort(U)
+
+  fit_line <- lm(observed ~ theoretical)
+  a <- coef(fit_line)[1]
+  b <- coef(fit_line)[2]
+
+  lower <- upper <- outside <- outside_ord <- NULL
+  if (band && n >= 2) {
+    set.seed(seed)
+    U_sim <- matrix(stats::runif(n * B), nrow = n, ncol = B)
+    U_sim <- apply(U_sim, 2, sort)
+    i_seq <- seq_len(n)
+
+    coverage_hat <- function(p) {
+      tail_p <- (1 - p) / 2
+      L <- stats::qbeta(tail_p, i_seq, n + 1 - i_seq)
+      U_up <- stats::qbeta(1 - tail_p, i_seq, n + 1 - i_seq)
+      mean(colSums(U_sim >= L & U_sim <= U_up) == n)
+    }
+
+    f <- function(p) coverage_hat(p) - conf
+    if (f(conf) >= 0) {
+      p_star <- conf
+    } else {
+      p_star <- stats::uniroot(f, lower = conf, upper = 0.9999, tol = 1e-4)$root
+    }
+
+    tail_star <- (1 - p_star) / 2
+    lower_raw <- stats::qbeta(tail_star, i_seq, n + 1 - i_seq)
+    upper_raw <- stats::qbeta(1 - tail_star, i_seq, n + 1 - i_seq)
+
+    lower <- a + b * lower_raw
+    upper <- a + b * upper_raw
+
+    outside_ord <- which(observed < lower | observed > upper)
+    outside     <- order(U)[outside_ord]
+  }
+
+  main_title <- "Diagnostic QQ-Plot"
+  if (!is.null(alpha) && !is.null(Cstar)) {
+    main_title <- substitute(
+      paste("Diagnostic QQ-Plot at ", alpha == aa, ", ", C^"*" == cs),
+      list(aa = alpha, cs = round(Cstar, 4)))
+  }
+
+  plot(theoretical, observed,
+       xlab = "Theoretical Unif(0,1) Quantiles",
+       ylab = expression(paste("Observed ", U[i], " Quantiles")),
+       main = main_title,
+       pch = 16, cex = 0.6, ...)
+
+  abline(fit_line, col = "red", lwd = 2)
+
+  if (band && n >= 2) {
+    lines(theoretical, lower, col = "grey50", lty = 2)
+    lines(theoretical, upper, col = "grey50", lty = 2)
+    if (length(outside_ord) > 0) {
+      points(theoretical[outside_ord], observed[outside_ord],
+             pch = 16, cex = 0.6, col = "red")
+    }
+  }
+
+  invisible(list(
+    theoretical = theoretical, observed = observed,
+    intercept = a, slope = b,
+    lower = lower, upper = upper, outside = outside
+  ))
+}
+
+# Main calibration wrapper: runs estimate_Cstar_alpha and produces 3 plots.
+calibration_plot_new <- function(p, ejab, up = 0.1, alpha = 0.05,
+                                  grid_range = c(0, 1), grid_n = 200,
+                                  n_alpha = 200, n = NULL, q = NULL, ...) {
+  fit <- estimate_Cstar_alpha(p, ejab, up, grid_range, grid_n, n_alpha)
+
+  nearest        <- which.min(abs(fit$alpha_grid - alpha))
+  Cstar_at_alpha <- fit$Cstar_alpha[nearest]
+
+  # Plot 1: Calibration curve
+  plot(fit$alpha_grid, fit$proportions,
+       type = "l", lwd = 2,
+       xlab = expression(alpha),
+       ylab = "Observed Proportion",
+       xlim = c(0, up),
+       ylim = c(0, max(fit$proportions, 1)),
+       main = expression(paste("Calibration using adaptive ", C^"*", "(", alpha, ")")),
+       ...)
+  abline(0, 1 / up, col = "red", lty = 2, lwd = 2)
+
+  # Plot 2: C*(alpha) vs alpha
+  plot(fit$alpha_grid, fit$Cstar_alpha,
+       type = "l", lwd = 2,
+       xlab = expression(alpha),
+       ylab = expression(C^"*" * (alpha)),
+       main = expression(paste(C^"*", "(", alpha, ") vs ", alpha)),
+       ...)
+  abline(h = 1, col = "grey50", lty = 3)
+
+  # Plot 3: Diagnostic QQ-plot at the pre-chosen alpha
+  if (!is.null(n) && !is.null(q)) {
+    idx <- which(p < alpha & ejab > Cstar_at_alpha)
+    if (length(idx) > 0) {
+      U_vals <- diagnostic_U(p[idx], n[idx], q[idx], alpha, Cstar_at_alpha)
+      diagnostic_qqplot_fit(U_vals, alpha = alpha, Cstar = Cstar_at_alpha, ...)
+    } else {
+      message("No candidates at alpha = ", alpha,
+              " with C* = ", round(Cstar_at_alpha, 4))
+    }
+  }
+
+  invisible(list(alpha_grid = fit$alpha_grid,
+                 Cstar_alpha = fit$Cstar_alpha,
+                 proportions = fit$proportions,
+                 Cstar_at_alpha = Cstar_at_alpha))
+}
+```
+
+Prepare data for EJAB method
+```{r}
+rpcb_df$p = pmax(as.numeric(rpcb_df$Original.p.value), .Machine$double.eps)
+rpcb_df$N = as.numeric(rpcb_df$Original.sample.size)
+rpcb_df$q = as.numeric(rpcb_df$Original.df1)
+is_chisq <- rpcb_df$Original.test.statistic.type == "chi-squared" & !is.na(rpcb_df$Original.test.statistic.type)
+rpcb_df$q[is.na(rpcb_df$q) & is_chisq] <- as.numeric(rpcb_df$Original.df2[is.na(rpcb_df$q) & is_chisq])
+rpcb_df$q[is.na(rpcb_df$q)] <- 1
+rpcb_df <- rpcb_df[!is.na(rpcb_df$q), ]
+
+rpcb_df <- rpcb_df[rpcb_df$N > 1 & rpcb_df$q >= 1, ]
+
+cat("Number of rows:", nrow(rpcb_df), "\n")
+cat("p range:", range(rpcb_df$p), "\n")
+cat("N range:", range(rpcb_df$N), "\n")
+cat("q range:", range(rpcb_df$q), "\n")
+```
+
+Run adaptive C*(alpha) calibration
+```{r calibration, fig.width=8, fig.height=6}
+up <- 0.1  # Upper threshold u_p
+
+# Compute eJAB for all studies
+rpcb_df$ejab <- ejab01(rpcb_df$p, rpcb_df$N, rpcb_df$q)
+
+# Run adaptive calibration — produces calibration curve, C*(alpha) plot,
+# and diagnostic QQ-plot with OLS fit + simultaneous confidence band
+cal_result <- calibration_plot_new(
+  p    = rpcb_df$p,
+  ejab = rpcb_df$ejab,
+  up   = up,
+  alpha = alpha,
+  grid_range = c(0, 3),
+  grid_n = 200,
+  n_alpha = 200,
+  n = rpcb_df$N,
+  q = rpcb_df$q
+)
+
+# Extract C*(alpha) at the chosen alpha
+Cstar <- cal_result$Cstar_at_alpha
+cat("Adaptive C*(alpha =", alpha, "):", Cstar, "\n")
+```
+
+Compute f, U diagnostic, and flag Type I candidates using adaptive C*(alpha)
+```{r}
+# f_i: the p-value threshold at which eJAB = C* for each study's (n, q)
+rpcb_df$f <- 1 - pchisq(
+  (2 * rpcb_df$N^(1 / rpcb_df$q) / (rpcb_df$N^(1 / rpcb_df$q) - 1)) * log(sqrt(rpcb_df$N) / Cstar),
+  df = rpcb_df$q
+)
+
+# Diagnostic U_i = (p_i - f_i) / (alpha - f_i)
+rpcb_df$U_diagnostic <- diagnostic_U(rpcb_df$p, rpcb_df$N, rpcb_df$q, alpha, Cstar)
+
+# Flag Type I candidates: p < alpha AND eJAB > C*(alpha)
+rpcb_df$type1_candidate <- (rpcb_df$p < alpha & rpcb_df$ejab > Cstar)
+```
+
+Summary and export
+```{r}
+# Summary
+cat("\nType I candidates:\n")
+print(rpcb_df[rpcb_df$type1_candidate, c("Paper..", "p", "ejab", "U_diagnostic", "replicated")])
+
+# Compare replication rates
+cat("\nReplication rate for Type I candidates:", 
+    mean(rpcb_df$replicated[rpcb_df$type1_candidate]), "\n")
+cat("Replication rate for non-Type I candidates:", 
+    mean(rpcb_df$replicated[!rpcb_df$type1_candidate]), "\n")
+
+# Export
+write_csv(rpcb_df, "rpcb_output.csv")
+```
+
+Ground truth comparison (using replication as proxy)
+```{r ground_truth}
+# In RPP, ground truth is approximated by replication outcome:
+#   "True T1E" = significant (p < alpha) AND failed to replicate
+#   This is a proxy — some non-replicating studies may be underpowered rather
+#   than true nulls, but it's the best available ground truth.
+
+n_total     <- nrow(rpcb_df)
+predicted   <- rpcb_df$type1_candidate
+real_t1e    <- (rpcb_df$p < alpha) & (rpcb_df$replicated == 0)
+
+n_real      <- sum(real_t1e)
+n_predicted <- sum(predicted)
+n_overlap   <- sum(real_t1e & predicted)
+
+# Sensitivity: of real T1Es, how many did we catch?
+sensitivity <- ifelse(n_real > 0, n_overlap / n_real, NA)
+
+# Specificity: of non-T1Es, how many did we correctly leave alone?
+n_not_t1e  <- n_total - n_real
+n_true_neg <- n_not_t1e - (n_predicted - n_overlap)
+specificity <- ifelse(n_not_t1e > 0, n_true_neg / n_not_t1e, NA)
+
+# False positives: predicted T1E but actually replicated
+n_false_pos <- n_predicted - n_overlap
+
+# PPV (precision): of predicted T1Es, how many are real?
+ppv <- ifelse(n_predicted > 0, n_overlap / n_predicted, NA)
+
+cat("## Ground Truth Comparison\n")
+cat(sprintf("- True T1Es (sig & did not replicate): %d / %d (%.1f%%)\n",
+            n_real, n_total, 100 * n_real / n_total))
+cat(sprintf("- Predicted T1Es: %d / %d (%.1f%%)\n",
+            n_predicted, n_total, 100 * n_predicted / n_total))
+cat(sprintf("- Correctly predicted: %d / %d (%.1f%%)\n",
+            n_overlap, n_real,
+            ifelse(n_real > 0, 100 * n_overlap / n_real, 0)))
+cat(sprintf("- False positives: %d\n", n_false_pos))
+cat(sprintf("- Sensitivity: %.3f\n", sensitivity))
+cat(sprintf("- Specificity: %.3f\n", specificity))
+cat(sprintf("- PPV (precision): %.3f\n", ppv))
+```
+
+Diagnostic QQ-Plot with OLS fit and simultaneous confidence band
+```{r diagnostic_qqplot, fig.width=8, fig.height=7}
+# ── Separate significant studies into detected Type I vs true positives ──
+sig_df <- rpcb_df[rpcb_df$p < alpha, ]
+n_sig  <- nrow(sig_df)
+
+type1_df <- sig_df[sig_df$type1_candidate == TRUE, ]
+tp_df    <- sig_df[sig_df$type1_candidate == FALSE, ]
+
+n_type1    <- nrow(type1_df)
+n_true_pos <- nrow(tp_df)
+
+rep_type1    <- mean(type1_df$replicated)
+rep_nontype1 <- mean(tp_df$replicated)
+
+cat(sprintf("Significant studies: %d\n", n_sig))
+cat(sprintf("  Detected Type I errors: %d  (replication rate %.1f%%)\n",
+            n_type1, rep_type1 * 100))
+cat(sprintf("  True positives:         %d  (replication rate %.1f%%)\n",
+            n_true_pos, rep_nontype1 * 100))
+
+# ── QQ-Plot using diagnostic_qqplot_fit (OLS + MC-calibrated band) ──
+type1_u   <- type1_df$U_diagnostic
+type1_rep <- type1_df$replicated
+
+# Save to PNG
+png("rpp_diagnostic_qqplot.png", width = 8, height = 7, units = "in", res = 300)
+qq_result <- diagnostic_qqplot_fit(type1_u, alpha = alpha, Cstar = Cstar)
+mtext(sprintf("%d detected Type I errors  |  replication rate %.0f%%",
+              n_type1, rep_type1 * 100),
+      side = 3, line = 0.3, cex = 0.85, col = "grey30")
+dev.off()
+
+# Also render in notebook
+qq_result <- diagnostic_qqplot_fit(type1_u, alpha = alpha, Cstar = Cstar)
+mtext(sprintf("%d detected Type I errors  |  replication rate %.0f%%",
+              n_type1, rep_type1 * 100),
+      side = 3, line = 0.3, cex = 0.85, col = "grey30")
+
+cat(sprintf("\nOLS fit: intercept = %.4f, slope = %.4f\n",
+            qq_result$intercept, qq_result$slope))
+if (length(qq_result$outside) > 0) {
+  cat(sprintf("Points outside 95%% simultaneous band: %d\n",
+              length(qq_result$outside)))
+}
+```
+
+Overlaid distributions of U_i: Type I candidates vs true positives
+```{r overlaid_distributions, fig.width=10, fig.height=5}
+tp_u <- tp_df$U_diagnostic
+
+# Clip true positives to reasonable range (remove extreme negatives)
+tp_u_clipped <- tp_u[tp_u >= -1]
+
+cat(sprintf("True positives clipped: keeping %d / %d with U_i >= -1\n",
+            length(tp_u_clipped), length(tp_u)))
+
+par(mfrow = c(1, 2))
+
+# ── Overlaid histograms ──
+brks <- seq(-1, 1, by = 0.1)
+
+hist(tp_u_clipped, breaks = brks, freq = FALSE,
+     col = adjustcolor("steelblue", 0.35), border = "steelblue",
+     main = expression(paste("Overlaid ", U[i], " Distributions")),
+     xlab = expression(U[i]), ylim = c(0, 3.5),
+     xlim = c(-1, 1))
+hist(type1_u, breaks = brks, freq = FALSE,
+     col = adjustcolor("red", 0.4), border = "red",
+     add = TRUE)
+abline(h = 1, col = "black", lwd = 2, lty = 2)
+legend("topleft",
+       legend = c("Detected Type I", "True Positive", "Unif(0,1) density"),
+       fill   = c(adjustcolor("red", 0.4), adjustcolor("steelblue", 0.35), NA),
+       border = c("red", "steelblue", NA),
+       lty    = c(NA, NA, 2), lwd = c(NA, NA, 2),
+       bty = "n", cex = 0.85)
+
+# ── Overlaid ECDFs ──
+plot(ecdf(type1_u), pch = 19, cex = 0.5, col = "red",
+     main = expression(paste("Overlaid ECDFs of ", U[i])),
+     xlab = expression(U[i]), ylab = "Cumulative Probability",
+     xlim = c(-1, 1))
+lines(ecdf(tp_u_clipped), pch = 19, cex = 0.5, col = "steelblue")
+abline(0, 1, col = "black", lwd = 2, lty = 2)
+legend("topleft",
+       legend = c("Detected Type I", "True Positive", "Unif(0,1) CDF"),
+       col = c("red", "steelblue", "black"),
+       lty = c(1, 1, 2), lwd = 2, bty = "n", cex = 0.85)
+
+par(mfrow = c(1, 1))
+
+# KS tests
+cat("\nKS test — Type I candidates vs Unif(0,1):\n")
+print(ks.test(type1_u, "punif"))
+cat("\nKS test — True positives vs Unif(0,1):\n")
+print(ks.test(tp_u, "punif"))
+```
+
+Pounds & Morris (2003) Beta-Uniform Mixture Model — exact implementation
+```{r bum_library}
+# Core BUM functions from Pounds & Morris (2003), adapted from the original
+# bum-library.R released by Stan Pounds at St. Jude Children's Research Hospital.
+
+dbum  <- function(x, a, lambda) lambda + (1 - lambda) * a * x^(a - 1)
+pbum  <- function(x, a, lambda) lambda * x + (1 - lambda) * x^a
+
+logit     <- function(x) log(x / (1 - x))
+inv.logit <- function(x) exp(x) / (1 + exp(x))
+
+neg.bum.logL <- function(pars, pvals) {
+  a      <- inv.logit(pars[1])
+  lambda <- inv.logit(pars[2])
+  -sum(log(dbum(pvals, a, lambda)))
+}
+
+bum.mle <- function(pvals, nstartpts = 10) {
+  adjeps   <- 0.5
+  nadj     <- length(pvals)
+  adjusted <- min(pvals) <= 0
+  if (adjusted) pvals <- (nadj * pvals + adjeps) / (nadj + 2 * adjeps)
+
+  starta      <- logit(runif(nstartpts + 1, 0.05, 0.95))
+  startlambda <- logit(runif(nstartpts + 1, 0.05, 0.95))
+  starta[1]      <- logit(0.5)
+  startlambda[1] <- logit(0.5)
+
+  bestlogL <- -Inf
+  for (i in seq_along(starta)) {
+    res <- tryCatch(
+      nlm(neg.bum.logL, c(starta[i], startlambda[i]), pvals = pvals),
+      error = function(e) NULL)
+    if (!is.null(res) && -res$minimum > bestlogL) {
+      a           <- inv.logit(res$estimate[1])
+      lambda      <- inv.logit(res$estimate[2])
+      logL        <- -res$minimum
+      bestlogL    <- logL
+      termination <- res$code
+    }
+  }
+  list(a = a, lambda = lambda, logL = logL,
+       pvals.adjusted = adjusted, termination = termination)
+}
+
+# Maximal uniform proportion extractable from BUM density (eq. 3 in paper)
+ext.pi <- function(a, lambda) lambda + (1 - lambda) * a
+
+# Empirical Bayes posterior P(alternative | p)
+bum.emp.post <- function(x, a, lambda) {
+  pi <- ext.pi(a, lambda)
+  (dbum(x, a, lambda) - pi) / dbum(x, a, lambda)
+}
+
+# False discovery rate at threshold tau
+bum.FDR <- function(tau, a, lambda) {
+  pi <- ext.pi(a, lambda)
+  tau * pi / pbum(tau, a, lambda)
+}
+
+# Proportions of error types at threshold tau
+bum.false.positive <- function(tau, a, lambda) tau * ext.pi(a, lambda)
+bum.true.positive  <- function(tau, a, lambda) pbum(tau, a, lambda) - tau * ext.pi(a, lambda)
+bum.false.negative <- function(tau, a, lambda) 1 - pbum(tau, a, lambda) - ext.pi(a, lambda) * (1 - tau)
+bum.true.negative  <- function(tau, a, lambda) ext.pi(a, lambda) * (1 - tau)
+
+# p-value threshold for a desired FDR level
+find.FDR.threshold <- function(fdr, a, lambda) {
+  pi <- ext.pi(a, lambda)
+  ((pi - fdr * lambda) / (fdr * (1 - lambda)))^(1 / (a - 1))
+}
+
+# p-value threshold for a desired EB posterior level
+find.EB.threshold <- function(EB, a, lambda) {
+  pi <- ext.pi(a, lambda)
+  ((EB * lambda + a * (1 - lambda)) / (a * (1 - EB) * (1 - lambda)))^(1 / (a - 1))
+}
+```
+
+Fit BUM via MLE to RPP p-values
+```{r bum_fit}
+set.seed(42)
+bum_fit <- bum.mle(rpcb_df$p, nstartpts = 20)
+
+pi_hat <- ext.pi(bum_fit$a, bum_fit$lambda)
+
+cat("Pounds & Morris BUM — MLE Estimates:\n")
+cat(sprintf("  a (Beta shape):       %.4f\n", bum_fit$a))
+cat(sprintf("  lambda (uniform wt):  %.4f\n", bum_fit$lambda))
+cat(sprintf("  pi (extracted null):  %.4f  [= lambda + (1-lambda)*a]\n", pi_hat))
+cat(sprintf("  log-likelihood:       %.2f\n", bum_fit$logL))
+cat(sprintf("  convergence code:     %d\n", bum_fit$termination))
+
+fdr_at_alpha <- bum.FDR(alpha, bum_fit$a, bum_fit$lambda)
+cat(sprintf("\nAt alpha = %.2f:\n", alpha))
+cat(sprintf("  FDR(alpha):                  %.4f\n", fdr_at_alpha))
+cat(sprintf("  Est. false positive rate:    %.4f\n",
+            bum.false.positive(alpha, bum_fit$a, bum_fit$lambda)))
+cat(sprintf("  Est. true positive rate:     %.4f\n",
+            bum.true.positive(alpha, bum_fit$a, bum_fit$lambda)))
+```
+
+BUM model fit visualization
+```{r bum_fit_plot, fig.width=10, fig.height=5}
+par(mfrow = c(1, 2))
+
+# Histogram with BUM density overlay
+h <- hist(rpcb_df$p, breaks = 30, plot = FALSE)
+hist(rpcb_df$p, breaks = 30, freq = FALSE,
+     col = adjustcolor("grey80", 0.5), border = "grey50",
+     main = "Pounds & Morris BUM Fit",
+     xlab = "p-value",
+     ylim = c(0, max(h$density) * 1.3))
+curve(dbum(x, bum_fit$a, bum_fit$lambda),
+      from = 0.001, to = 1, add = TRUE, col = "red", lwd = 2, n = 500)
+abline(h = pi_hat, col = "blue", lty = 2, lwd = 1.5)
+legend("topright",
+       legend = c(
+         sprintf("BUM density (a=%.3f, lam=%.3f)", bum_fit$a, bum_fit$lambda),
+         sprintf("Extracted null pi=%.3f", pi_hat)),
+       col = c("red", "blue"), lty = c(1, 2), lwd = c(2, 1.5), bty = "n", cex = 0.8)
+
+# Error region diagram
+n_total_studies <- nrow(rpcb_df)
+fp_prop <- bum.false.positive(alpha, bum_fit$a, bum_fit$lambda)
+tp_prop <- bum.true.positive(alpha, bum_fit$a, bum_fit$lambda)
+fn_prop <- bum.false.negative(alpha, bum_fit$a, bum_fit$lambda)
+tn_prop <- bum.true.negative(alpha, bum_fit$a, bum_fit$lambda)
+
+barplot(c(FP = fp_prop, TP = tp_prop, FN = fn_prop, TN = tn_prop) * n_total_studies,
+        col = c("red", "green3", "orange", "steelblue"),
+        main = sprintf("BUM Error Partition at alpha=%.2f", alpha),
+        ylab = "Estimated count", las = 1)
+legend("topright",
+       legend = sprintf(c("FP: %.1f", "TP: %.1f", "FN: %.1f", "TN: %.1f"),
+                        c(fp_prop, tp_prop, fn_prop, tn_prop) * n_total_studies),
+       fill = c("red", "green3", "orange", "steelblue"), bty = "n", cex = 0.8)
+
+par(mfrow = c(1, 1))
+```
+
+BUM-based Type I error detection using EB posterior (exact P&M approach)
+```{r bum_classification}
+# Pounds & Morris EB posterior: P(alternative | p_i)
+# A study is classified as null (Type I error) when EB posterior < 0.5,
+# meaning it is more likely null than alternative.
+rpcb_df$eb_post <- bum.emp.post(rpcb_df$p, bum_fit$a, bum_fit$lambda)
+
+# EB threshold: the p-value below which EB posterior > 0.5
+eb_threshold <- find.EB.threshold(0.5, bum_fit$a, bum_fit$lambda)
+
+cat(sprintf("EB posterior threshold (P(alt|p) = 0.5) at p = %.6f\n", eb_threshold))
+cat(sprintf("  alpha = %.4f\n", alpha))
+
+if (eb_threshold < alpha) {
+  cat(sprintf("  eb_threshold < alpha: significant studies with p in (%.6f, %.4f]\n",
+              eb_threshold, alpha))
+  cat("  are classified as more likely null than alternative.\n")
+} else {
+  cat("  eb_threshold >= alpha: all significant studies have EB posterior > 0.5,\n")
+  cat("  so the BUM classifies all of them as likely alternatives.\n")
+}
+
+# Predicted T1Es: significant AND EB posterior < 0.5
+rpcb_df$pm_type1 <- (rpcb_df$p < alpha) & (rpcb_df$eb_post < 0.5)
+
+# Also flag using FDR-based count: expected # of FPs among significant studies
+n_sig <- sum(rpcb_df$p < alpha)
+n_expected_fp <- round(fdr_at_alpha * n_sig)
+
+cat(sprintf("\n--- Classification Results ---\n"))
+cat(sprintf("Significant studies:              %d\n", n_sig))
+cat(sprintf("BUM EB-posterior T1E (post<0.5):  %d\n", sum(rpcb_df$pm_type1)))
+cat(sprintf("BUM FDR-expected T1Es:            %d  (FDR=%.3f x %d)\n",
+            n_expected_fp, fdr_at_alpha, n_sig))
+cat(sprintf("eJAB predicted T1Es:              %d\n", sum(rpcb_df$type1_candidate)))
+
+# EB posterior summary for significant studies
+sig_eb <- rpcb_df$eb_post[rpcb_df$p < alpha]
+cat(sprintf("\nEB posterior summary (significant studies):\n"))
+print(summary(sig_eb))
+```
+
+Head-to-head comparison: eJAB vs Pounds & Morris BUM
+```{r head_to_head}
+# --- Direct EB posterior classification (the exact P&M approach) ---
+pm_predicted   <- rpcb_df$pm_type1
+pm_n_predicted <- sum(pm_predicted)
+pm_n_overlap   <- sum(real_t1e & pm_predicted)
+pm_n_false_pos <- pm_n_predicted - pm_n_overlap
+
+pm_sensitivity <- ifelse(n_real > 0, pm_n_overlap / n_real, NA)
+pm_n_true_neg  <- (n_total - n_real) - pm_n_false_pos
+pm_specificity <- ifelse(n_not_t1e > 0, pm_n_true_neg / n_not_t1e, NA)
+pm_ppv         <- ifelse(pm_n_predicted > 0, pm_n_overlap / pm_n_predicted, NA)
+
+# --- FDR-budget comparison: flag top-k by lowest EB posterior, k = FDR-expected count ---
+sig_rows <- which(rpcb_df$p < alpha)
+rpcb_df$pm_fdr_flag <- FALSE
+
+if (n_expected_fp > 0 && length(sig_rows) >= n_expected_fp) {
+  eb_sig      <- rpcb_df$eb_post[sig_rows]
+  top_k       <- order(eb_sig)[1:n_expected_fp]
+  fdr_flag_idx <- sig_rows[top_k]
+  rpcb_df$pm_fdr_flag[fdr_flag_idx] <- TRUE
+}
+
+fdr_n_predicted <- sum(rpcb_df$pm_fdr_flag)
+fdr_n_overlap   <- sum(real_t1e & rpcb_df$pm_fdr_flag)
+fdr_n_fp        <- fdr_n_predicted - fdr_n_overlap
+fdr_sens        <- ifelse(n_real > 0, fdr_n_overlap / n_real, NA)
+fdr_spec        <- ifelse(n_not_t1e > 0, (n_not_t1e - fdr_n_fp) / n_not_t1e, NA)
+fdr_ppv         <- ifelse(fdr_n_predicted > 0, fdr_n_overlap / fdr_n_predicted, NA)
+fdr_rep         <- ifelse(fdr_n_predicted > 0, mean(rpcb_df$replicated[rpcb_df$pm_fdr_flag]), NA)
+
+comparison_df <- data.frame(
+  Metric = c("Predicted T1Es", "Correctly Identified", "False Positives",
+             "Sensitivity", "Specificity", "PPV (Precision)", "Replication Rate"),
+  eJAB = c(n_predicted, n_overlap, n_false_pos,
+           round(sensitivity, 3), round(specificity, 3), round(ppv, 3),
+           round(mean(rpcb_df$replicated[rpcb_df$type1_candidate]), 3)),
+  BUM_EB = c(pm_n_predicted, pm_n_overlap, pm_n_false_pos,
+             round(pm_sensitivity, 3), round(pm_specificity, 3), round(pm_ppv, 3),
+             ifelse(pm_n_predicted > 0,
+                    round(mean(rpcb_df$replicated[rpcb_df$pm_type1]), 3), NA)),
+  BUM_FDR_budget = c(fdr_n_predicted, fdr_n_overlap, fdr_n_fp,
+                     round(fdr_sens, 3), round(fdr_spec, 3), round(fdr_ppv, 3),
+                     round(fdr_rep, 3))
+)
+
+cat("\n## Head-to-Head: eJAB vs Pounds & Morris BUM\n")
+cat("   BUM_EB:         EB posterior < 0.5 (exact P&M classification)\n")
+cat("   BUM_FDR_budget: top-k by lowest EB posterior, k = FDR*n_sig\n\n")
+print(comparison_df, row.names = FALSE)
+
+# McNemar's test comparing eJAB vs BUM FDR-budget classification
+b_fdr <- sum(rpcb_df$type1_candidate & !rpcb_df$pm_fdr_flag)
+c_fdr <- sum(!rpcb_df$type1_candidate & rpcb_df$pm_fdr_flag)
+cat(sprintf("\nMcNemar's test — eJAB vs BUM_FDR_budget (eJAB-only=%d, BUM-only=%d):\n",
+            b_fdr, c_fdr))
+if (b_fdr + c_fdr > 0) {
+  print(mcnemar.test(table(rpcb_df$type1_candidate, rpcb_df$pm_fdr_flag)))
+} else {
+  cat("  Methods agree on all studies.\n")
+}
+```
+
+ROC comparison among significant studies
+```{r roc_comparison, fig.width=8, fig.height=7}
+sig_idx   <- which(rpcb_df$p < alpha)
+sig_truth <- real_t1e[sig_idx]
+
+# eJAB: higher = more likely null
+score_ejab <- rpcb_df$ejab[sig_idx]
+# BUM EB posterior: LOWER = more likely null, so negate for consistent direction
+score_bum  <- -rpcb_df$eb_post[sig_idx]
+
+simple_roc <- function(score, truth) {
+  ord   <- order(score, decreasing = TRUE)
+  score <- score[ord]
+  truth <- truth[ord]
+
+  tp    <- cumsum(truth)
+  fp    <- cumsum(!truth)
+  n_pos <- sum(truth)
+  n_neg <- sum(!truth)
+
+  tpr <- c(0, tp / n_pos, 1)
+  fpr <- c(0, fp / n_neg, 1)
+  data.frame(fpr = fpr, tpr = tpr)
+}
+
+trap_auc <- function(roc) {
+  n <- nrow(roc)
+  sum(diff(roc$fpr) * (roc$tpr[-1] + roc$tpr[-n]) / 2)
+}
+
+roc_ejab <- simple_roc(score_ejab, sig_truth)
+roc_bum  <- simple_roc(score_bum,  sig_truth)
+auc_ejab <- trap_auc(roc_ejab)
+auc_bum  <- trap_auc(roc_bum)
+
+plot(roc_ejab$fpr, roc_ejab$tpr, type = "l", col = "red", lwd = 2,
+     xlab = "False Positive Rate (1 - Specificity)",
+     ylab = "True Positive Rate (Sensitivity)",
+     main = "ROC: eJAB vs Pounds & Morris BUM\n(among significant studies)")
+lines(roc_bum$fpr, roc_bum$tpr, col = "blue", lwd = 2)
+abline(0, 1, lty = 2, col = "grey50")
+legend("bottomright",
+       legend = c(sprintf("eJAB (AUC = %.3f)", auc_ejab),
+                  sprintf("BUM  (AUC = %.3f)", auc_bum)),
+       col = c("red", "blue"), lwd = 2, bty = "n")
+
+cat(sprintf("AUC — eJAB: %.4f\n", auc_ejab))
+cat(sprintf("AUC — BUM:  %.4f\n", auc_bum))
+```
+
+eJAB vs BUM EB posterior scatter plot for significant studies
+```{r scatter_comparison, fig.width=9, fig.height=6}
+sig_df_ext <- rpcb_df[rpcb_df$p < alpha, ]
+
+plot(sig_df_ext$ejab, sig_df_ext$eb_post,
+     pch = 16, cex = 0.9,
+     col = ifelse(sig_df_ext$replicated == 1,
+                  adjustcolor("steelblue", 0.6),
+                  adjustcolor("red", 0.6)),
+     xlab = "eJAB statistic",
+     ylab = "BUM EB posterior P(alt | p)",
+     main = "eJAB vs P&M EB Posterior (significant studies)")
+
+abline(h = 0.5, lty = 2, col = "grey50")
+abline(v = Cstar, lty = 2, col = "grey50")
+
+text(x = max(sig_df_ext$ejab) * 0.95, y = 0.53,
+     "EB post = 0.5", cex = 0.65, col = "grey40", pos = 2)
+text(x = Cstar, y = max(sig_df_ext$eb_post) * 0.98,
+     sprintf("C* = %.3f", Cstar), cex = 0.65, col = "grey40", pos = 4)
+
+legend("bottomright",
+       legend = c("Replicated", "Did not replicate"),
+       col = c("steelblue", "red"), pch = 16, bty = "n")
+
+# Quadrant analysis: eJAB>C* flags T1E; EB post < 0.5 flags T1E
+q_both    <- sum(sig_df_ext$ejab > Cstar & sig_df_ext$eb_post < 0.5)
+q_ejab    <- sum(sig_df_ext$ejab > Cstar & sig_df_ext$eb_post >= 0.5)
+q_bum     <- sum(sig_df_ext$ejab <= Cstar & sig_df_ext$eb_post < 0.5)
+q_neither <- sum(sig_df_ext$ejab <= Cstar & sig_df_ext$eb_post >= 0.5)
+
+cat(sprintf("\nQuadrant Analysis (significant studies, n=%d):\n", nrow(sig_df_ext)))
+cat(sprintf("  Both flag T1E  (eJAB>C* & EB<0.5):  %d\n", q_both))
+cat(sprintf("  eJAB only      (eJAB>C* & EB>=0.5): %d\n", q_ejab))
+cat(sprintf("  BUM only       (eJAB<=C* & EB<0.5): %d\n", q_bum))
+cat(sprintf("  Neither flags  (eJAB<=C* & EB>=0.5):%d\n", q_neither))
+
+if (q_both > 0)
+  cat(sprintf("  Rep rate — both flag:    %.1f%%\n",
+              mean(sig_df_ext$replicated[sig_df_ext$ejab > Cstar &
+                                         sig_df_ext$eb_post < 0.5]) * 100))
+if (q_ejab > 0)
+  cat(sprintf("  Rep rate — eJAB only:    %.1f%%\n",
+              mean(sig_df_ext$replicated[sig_df_ext$ejab > Cstar &
+                                         sig_df_ext$eb_post >= 0.5]) * 100))
+if (q_bum > 0)
+  cat(sprintf("  Rep rate — BUM only:     %.1f%%\n",
+              mean(sig_df_ext$replicated[sig_df_ext$ejab <= Cstar &
+                                         sig_df_ext$eb_post < 0.5]) * 100))
+if (q_neither > 0)
+  cat(sprintf("  Rep rate — neither:      %.1f%%\n",
+              mean(sig_df_ext$replicated[sig_df_ext$ejab <= Cstar &
+                                         sig_df_ext$eb_post >= 0.5]) * 100))
+```
