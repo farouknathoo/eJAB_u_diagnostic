@@ -2,3 +2,13 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Large data files
+jtc/ctg-studies.json
+jtc/ctg-studies.json.zip
+jtc/study3.csv
+jtc/study3.zip
+simulations/data/ejab_grid_simulation.zip
+simulations/data/ejab_simulation_data.zip
+ctg_ejab_results.csv
+rmd/tree_plots.pdf
