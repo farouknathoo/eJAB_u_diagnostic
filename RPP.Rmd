@@ -7,6 +7,11 @@ date: "2025-12-12"
 ```{r}
 library(dplyr)
 library(readr)
+if (!require("ejabT1E", quietly = TRUE)) {
+  stop("Install ejabT1E: devtools::install_github(\"nathoogroup/ejabT1E\", subdir = \"ejabT1E\")")
+}
+# diagnostic_qqplot exists in ejabT1E but is not exported
+diagnostic_qqplot <- getFromNamespace("diagnostic_qqplot", "ejabT1E")
 ```
 
 ```{r}
@@ -20,187 +25,14 @@ rppdf = rppdf[complete.cases(rppdf),]
 rppdf$replicated = ifelse(rppdf$T_pval_USE..R. < alpha, 1, 0)
 ```
 
-Core eJAB functions
+Core eJAB functions (from ejabT1E: ejab01, detect_type1, diagnostic_U)
+
+Integrated C* estimation (ejabT1E package)
 ```{r}
-# EJAB01
-ejab01 <- function(p, n, q) {
-  stopifnot(all(p > 0 & p < 1), all(n > 1), all(q >= 1))
-  
-  chi_quant <- qchisq(1 - p, df = q)
-  sqrt(n) * exp(-0.5 * (n^(1/q) - 1) / n^(1/q) * chi_quant)
-}
-
-# Type 1 identifier
-detect_type1 <- function(p, ejab, alpha, Cstar) {
-  which(p < alpha & ejab > Cstar)
-}
-
-# Diagnostic U_i
-diagnostic_U <- function(p, n, q, alpha, Cstar) {
-  d <- 1 - pchisq(
-    (2 * n^(1/q) / (n^(1/q) - 1)) * log(sqrt(n) / Cstar),
-    df = q
-  )
-  (p - d) / (alpha - d)
-}
-```
-
-Adaptive C*(alpha) calibration (from calibration_new.R)
-```{r}
-# Estimate a separate C*(alpha) for each alpha on a grid in (0, up].
-# At each alpha, C*(alpha) minimises (observed_proportion - alpha/up)^2
-# where proportion = count(p <= alpha AND ejab > C) / count(p < up).
-estimate_Cstar_alpha <- function(p, ejab, up = 0.1,
-                                  grid_range = c(0, 1), grid_n = 200,
-                                  n_alpha = 200) {
-  alpha_grid <- seq(0, up, length.out = n_alpha + 1)[-1]
-  C_grid     <- seq(grid_range[1], grid_range[2], length.out = grid_n)
-  N          <- sum(p < up)
-
-  Cstar_alpha <- numeric(length(alpha_grid))
-  proportions <- numeric(length(alpha_grid))
-
-  for (i in seq_along(alpha_grid)) {
-    a      <- alpha_grid[i]
-    target <- a / up
-    props  <- vapply(C_grid, function(C) sum(p < a & ejab > C) / N, numeric(1))
-    best   <- which.min((props - target)^2)
-    Cstar_alpha[i] <- C_grid[best]
-    proportions[i] <- props[best]
-  }
-
-  list(alpha_grid = alpha_grid,
-       Cstar_alpha = Cstar_alpha,
-       proportions = proportions)
-}
-
-# Diagnostic QQ-plot with OLS best-fit line and MC-calibrated
-# simultaneous confidence band (adapted from calibration_new.R).
-diagnostic_qqplot_fit <- function(U, alpha = NULL, Cstar = NULL,
-                                   band = TRUE, conf = 0.95,
-                                   B = 10000, seed = 1, ...) {
-  n <- length(U)
-  if (n == 0) {
-    message("No candidate T1Es detected; cannot produce QQ-plot.")
-    return(invisible(NULL))
-  }
-
-  theoretical <- stats::ppoints(n)
-  observed    <- sort(U)
-
-  fit_line <- lm(observed ~ theoretical)
-  a <- coef(fit_line)[1]
-  b <- coef(fit_line)[2]
-
-  lower <- upper <- outside <- outside_ord <- NULL
-  if (band && n >= 2) {
-    set.seed(seed)
-    U_sim <- matrix(stats::runif(n * B), nrow = n, ncol = B)
-    U_sim <- apply(U_sim, 2, sort)
-    i_seq <- seq_len(n)
-
-    coverage_hat <- function(p) {
-      tail_p <- (1 - p) / 2
-      L <- stats::qbeta(tail_p, i_seq, n + 1 - i_seq)
-      U_up <- stats::qbeta(1 - tail_p, i_seq, n + 1 - i_seq)
-      mean(colSums(U_sim >= L & U_sim <= U_up) == n)
-    }
-
-    f <- function(p) coverage_hat(p) - conf
-    if (f(conf) >= 0) {
-      p_star <- conf
-    } else {
-      p_star <- stats::uniroot(f, lower = conf, upper = 0.9999, tol = 1e-4)$root
-    }
-
-    tail_star <- (1 - p_star) / 2
-    lower_raw <- stats::qbeta(tail_star, i_seq, n + 1 - i_seq)
-    upper_raw <- stats::qbeta(1 - tail_star, i_seq, n + 1 - i_seq)
-
-    lower <- a + b * lower_raw
-    upper <- a + b * upper_raw
-
-    outside_ord <- which(observed < lower | observed > upper)
-    outside     <- order(U)[outside_ord]
-  }
-
-  main_title <- "Diagnostic QQ-Plot"
-  if (!is.null(alpha) && !is.null(Cstar)) {
-    main_title <- substitute(
-      paste("Diagnostic QQ-Plot at ", alpha == aa, ", ", C^"*" == cs),
-      list(aa = alpha, cs = round(Cstar, 4)))
-  }
-
-  plot(theoretical, observed,
-       xlab = "Theoretical Unif(0,1) Quantiles",
-       ylab = expression(paste("Observed ", U[i], " Quantiles")),
-       main = main_title,
-       pch = 16, cex = 0.6, ...)
-
-  abline(fit_line, col = "red", lwd = 2)
-
-  if (band && n >= 2) {
-    lines(theoretical, lower, col = "grey50", lty = 2)
-    lines(theoretical, upper, col = "grey50", lty = 2)
-    if (length(outside_ord) > 0) {
-      points(theoretical[outside_ord], observed[outside_ord],
-             pch = 16, cex = 0.6, col = "red")
-    }
-  }
-
-  invisible(list(
-    theoretical = theoretical, observed = observed,
-    intercept = a, slope = b,
-    lower = lower, upper = upper, outside = outside
-  ))
-}
-
-# Main calibration wrapper: runs estimate_Cstar_alpha and produces 3 plots.
-calibration_plot_new <- function(p, ejab, up = 0.1, alpha = 0.05,
-                                  grid_range = c(0, 1), grid_n = 200,
-                                  n_alpha = 200, n = NULL, q = NULL, ...) {
-  fit <- estimate_Cstar_alpha(p, ejab, up, grid_range, grid_n, n_alpha)
-
-  nearest        <- which.min(abs(fit$alpha_grid - alpha))
-  Cstar_at_alpha <- fit$Cstar_alpha[nearest]
-
-  # Plot 1: Calibration curve
-  plot(fit$alpha_grid, fit$proportions,
-       type = "l", lwd = 2,
-       xlab = expression(alpha),
-       ylab = "Observed Proportion",
-       xlim = c(0, up),
-       ylim = c(0, max(fit$proportions, 1)),
-       main = expression(paste("Calibration using adaptive ", C^"*", "(", alpha, ")")),
-       ...)
-  abline(0, 1 / up, col = "red", lty = 2, lwd = 2)
-
-  # Plot 2: C*(alpha) vs alpha
-  plot(fit$alpha_grid, fit$Cstar_alpha,
-       type = "l", lwd = 2,
-       xlab = expression(alpha),
-       ylab = expression(C^"*" * (alpha)),
-       main = expression(paste(C^"*", "(", alpha, ") vs ", alpha)),
-       ...)
-  abline(h = 1, col = "grey50", lty = 3)
-
-  # Plot 3: Diagnostic QQ-plot at the pre-chosen alpha
-  if (!is.null(n) && !is.null(q)) {
-    idx <- which(p < alpha & ejab > Cstar_at_alpha)
-    if (length(idx) > 0) {
-      U_vals <- diagnostic_U(p[idx], n[idx], q[idx], alpha, Cstar_at_alpha)
-      diagnostic_qqplot_fit(U_vals, alpha = alpha, Cstar = Cstar_at_alpha, ...)
-    } else {
-      message("No candidates at alpha = ", alpha,
-              " with C* = ", round(Cstar_at_alpha, 4))
-    }
-  }
-
-  invisible(list(alpha_grid = fit$alpha_grid,
-                 Cstar_alpha = fit$Cstar_alpha,
-                 proportions = fit$proportions,
-                 Cstar_at_alpha = Cstar_at_alpha))
-}
+# Uses estimate_Cstar from ejabT1E: minimizes integrated squared deviation
+# between empirical contradiction rate and theoretical T1E rate (closed-form
+# objective), instead of pointwise (proportion - alpha/up)^2 per alpha.
+# See: https://github.com/nathoogroup/ejabT1E
 ```
 
 Prepare data for EJAB method
@@ -219,33 +51,58 @@ cat("N range:", range(rppdf$N), "\n")
 cat("q range:", range(rppdf$q), "\n")
 ```
 
-Run adaptive C*(alpha) calibration
-```{r calibration, fig.width=8, fig.height=6}
+Run integrated C* estimation and candidate T1E accumulation rate plots (ejabT1E)
+```{r calibration, fig.width=14, fig.height=5}
 up <- 0.1  # Upper threshold u_p
 
-# Compute eJAB for all studies
+# Compute eJAB for all studies (using ejabT1E)
 rppdf$ejab <- ejab01(rppdf$p, rppdf$N, rppdf$q)
 
-# Run adaptive calibration — produces calibration curve, C*(alpha) plot,
-# and diagnostic QQ-plot with OLS fit + simultaneous confidence band
-cal_result <- calibration_plot_new(
-  p    = rppdf$p,
-  ejab = rppdf$ejab,
-  up   = up,
-  alpha = alpha,
-  grid_range = c(0, 3),
-  grid_n = 200,
-  n_alpha = 200,
-  n = rppdf$N,
-  q = rppdf$q
-)
+# Estimate C* via integrated objective (minimizes integrated squared deviation)
+Cfit <- estimate_Cstar(rppdf$p, rppdf$ejab, up = up,
+                      grid_range = c(1/3, 3), grid_n = 200)
+Cstar <- Cfit$Cstar
 
-# Extract C*(alpha) at the chosen alpha
-Cstar <- cal_result$Cstar_at_alpha
-cat("Adaptive C*(alpha =", alpha, "):", Cstar, "\n")
+# Candidate T1E accumulation rate: proportion vs alpha (using fixed C*)
+N <- sum(rppdf$p < up)
+alpha_grid <- seq(0, up, length.out = 201)[-1]
+proportions <- vapply(alpha_grid, function(a) {
+  sum(rppdf$p < a & rppdf$ejab > Cstar) / N
+}, numeric(1))
+
+par(mfrow = c(1, 3))
+
+# Panel 1: Candidate Type I error accumulation rate
+plot(alpha_grid, proportions, type = "l", lwd = 2,
+     xlab = expression(alpha), ylab = "Observed Proportion",
+     xlim = c(0, up), ylim = c(0, max(proportions, 1)),
+     main = "Candidate T1E Accumulation Rate")
+abline(0, 1 / up, col = "red", lty = 2, lwd = 2)
+legend("topleft", legend = c("Observed", "Reference (slope 1/up)"),
+       col = c("black", "red"), lty = c(1, 2), lwd = 2, bty = "n", cex = 0.8)
+
+# Panel 2: Integrated objective vs C
+plot(Cfit$grid, Cfit$all_objectives, type = "l", lwd = 1.5,
+     xlab = "C", ylab = "Objective",
+     main = "Integrated Objective vs C")
+abline(v = Cstar, col = "red", lty = 2)
+
+# Panel 3: Diagnostic QQ-plot at alpha
+idx_t1e <- which(rppdf$p < alpha & rppdf$ejab > Cstar)
+if (length(idx_t1e) > 0) {
+  U_vals <- diagnostic_U(rppdf$p[idx_t1e], rppdf$N[idx_t1e], rppdf$q[idx_t1e],
+                         alpha, Cstar)
+  diagnostic_qqplot(U_vals, alpha = alpha, Cstar = Cstar)
+} else {
+  plot(1, type = "n", main = "No candidates", xlab = "", ylab = "")
+}
+par(mfrow = c(1, 1))
+
+cat("Integrated C* (alpha =", alpha, "):", round(Cstar, 4), "\n")
+cat("Minimized objective:", round(Cfit$objective, 6), "\n")
 ```
 
-Compute f, U diagnostic, and flag Type I candidates using adaptive C*(alpha)
+Compute f, U diagnostic, and flag Type I candidates using integrated C*
 ```{r}
 # f_i: the p-value threshold at which eJAB = C* for each study's (n, q)
 rppdf$f <- 1 - pchisq(
@@ -256,7 +113,7 @@ rppdf$f <- 1 - pchisq(
 # Diagnostic U_i = (p_i - f_i) / (alpha - f_i)
 rppdf$U_diagnostic <- diagnostic_U(rppdf$p, rppdf$N, rppdf$q, alpha, Cstar)
 
-# Flag Type I candidates: p < alpha AND eJAB > C*(alpha)
+# Flag Type I candidates: p < alpha AND eJAB > C*
 rppdf$type1_candidate <- (rppdf$p < alpha & rppdf$ejab > Cstar)
 ```
 
@@ -340,20 +197,20 @@ cat(sprintf("  Detected Type I errors: %d  (replication rate %.1f%%)\n",
 cat(sprintf("  True positives:         %d  (replication rate %.1f%%)\n",
             n_true_pos, rep_nontype1 * 100))
 
-# ── QQ-Plot using diagnostic_qqplot_fit (OLS + MC-calibrated band) ──
+# ── QQ-Plot using diagnostic_qqplot (OLS + MC-calibrated band) ──
 type1_u   <- type1_df$U_diagnostic
 type1_rep <- type1_df$replicated
 
 # Save to PNG
 png("rpp_diagnostic_qqplot.png", width = 8, height = 7, units = "in", res = 300)
-qq_result <- diagnostic_qqplot_fit(type1_u, alpha = alpha, Cstar = Cstar)
+qq_result <- diagnostic_qqplot(type1_u, alpha = alpha, Cstar = Cstar)
 mtext(sprintf("%d detected Type I errors  |  replication rate %.0f%%",
               n_type1, rep_type1 * 100),
       side = 3, line = 0.3, cex = 0.85, col = "grey30")
 dev.off()
 
 # Also render in notebook
-qq_result <- diagnostic_qqplot_fit(type1_u, alpha = alpha, Cstar = Cstar)
+qq_result <- diagnostic_qqplot(type1_u, alpha = alpha, Cstar = Cstar)
 mtext(sprintf("%d detected Type I errors  |  replication rate %.0f%%",
               n_type1, rep_type1 * 100),
       side = 3, line = 0.3, cex = 0.85, col = "grey30")
