@@ -60,7 +60,7 @@ rppdf$ejab <- ejab01(rppdf$p, rppdf$N, rppdf$q)
 
 # Estimate C* via integrated objective (minimizes integrated squared deviation)
 Cfit <- estimate_Cstar(rppdf$p, rppdf$ejab, up = up,
-                      grid_range = c(1/3, 3), grid_n = 200)
+                      grid_range = c(0, 3), grid_n = 200)
 Cstar <- Cfit$Cstar
 
 # Candidate T1E accumulation rate: proportion vs alpha (using fixed C*)
