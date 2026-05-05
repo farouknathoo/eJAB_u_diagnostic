@@ -7,6 +7,8 @@ date: "2025-12-12"
 ```{r}
 library(dplyr)
 library(readr)
+library(ggplot2)
+library(patchwork)
 if (!require("ejabT1E", quietly = TRUE)) {
   stop("Install ejabT1E: devtools::install_github(\"nathoogroup/ejabT1E\", subdir = \"ejabT1E\")")
 }
@@ -57,8 +59,8 @@ cat("N range:", range(rpcb_df$N), "\n")
 cat("q range:", range(rpcb_df$q), "\n")
 ```
 
-Run integrated C* estimation and candidate T1E accumulation rate plots (ejabT1E)
-```{r calibration, fig.width=14, fig.height=5}
+Run integrated C* estimation and produce the two-panel diagnostic figure
+```{r calibration, fig.width=12, fig.height=5}
 up <- 0.1  # Upper threshold u_p
 
 # Compute eJAB for all studies (using ejabT1E)
@@ -69,43 +71,69 @@ Cfit <- estimate_Cstar(rpcb_df$p, rpcb_df$ejab, up = up,
                       grid_range = c(0, 3), grid_n = 200)
 Cstar <- Cfit$Cstar
 
-# Candidate T1E accumulation rate: proportion vs alpha (using fixed C*)
-N <- sum(rpcb_df$p < up)
-alpha_grid <- seq(0, up, length.out = 201)[-1]
-proportions <- vapply(alpha_grid, function(a) {
-  sum(rpcb_df$p < a & rpcb_df$ejab > Cstar) / N
+# ── Panel (a): Calibration curve over alpha in (0, 0.05] ──
+N_up <- sum(rpcb_df$p < up)
+alpha_grid <- seq(0, alpha, length.out = 201)[-1]
+emp_rate <- vapply(alpha_grid, function(a) {
+  sum(rpcb_df$p < a & rpcb_df$ejab > Cstar) / N_up
 }, numeric(1))
+ref_rate <- alpha_grid / up
 
-par(mfrow = c(1, 3))
+cal_df <- data.frame(alpha = alpha_grid, emp = emp_rate, ref = ref_rate)
 
-# Panel 1: Candidate Type I error accumulation rate
-plot(alpha_grid, proportions, type = "l", lwd = 2,
-     xlab = expression(alpha), ylab = "Observed Proportion",
-     xlim = c(0, up), ylim = c(0, max(proportions, 1)),
-     main = "Candidate T1E Accumulation Rate")
-abline(0, 1 / up, col = "red", lty = 2, lwd = 2)
-legend("topleft", legend = c("Observed", "Reference (slope 1/up)"),
-       col = c("black", "red"), lty = c(1, 2), lwd = 2, bty = "n", cex = 0.8)
+p_cal <- ggplot(cal_df, aes(x = alpha)) +
+  geom_line(aes(y = ref), color = "#D62728", linetype = "dashed", linewidth = 0.9) +
+  geom_step(aes(y = emp), color = "#1F77B4", linewidth = 0.9) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = expression(alpha), y = "Empirical contradiction rate",
+       title = "(a) Calibration curve") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0, face = "plain", size = 14),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "grey30"),
+        axis.ticks = element_line(color = "grey30"))
 
-# Panel 2: Integrated objective vs C
-plot(Cfit$grid, Cfit$all_objectives, type = "l", lwd = 1.5,
-     xlab = "C", ylab = "Objective",
-     main = "Integrated Objective vs C")
-abline(v = Cstar, col = "red", lty = 2)
-
-# Panel 3: Diagnostic QQ-plot at alpha
+# ── Panel (b): Q-Q diagnostic with simultaneous Beta band ──
 idx_t1e <- which(rpcb_df$p < alpha & rpcb_df$ejab > Cstar)
-if (length(idx_t1e) > 0) {
-  U_vals <- diagnostic_U(rpcb_df$p[idx_t1e], rpcb_df$N[idx_t1e], rpcb_df$q[idx_t1e],
-                         alpha, Cstar)
-  diagnostic_qqplot(U_vals, alpha = alpha, Cstar = Cstar)
-} else {
-  plot(1, type = "n", main = "No candidates", xlab = "", ylab = "")
-}
-par(mfrow = c(1, 1))
+U_vals <- diagnostic_U(rpcb_df$p[idx_t1e], rpcb_df$N[idx_t1e], rpcb_df$q[idx_t1e],
+                       alpha, Cstar)
+
+# Use ejabT1E's diagnostic_qqplot to compute band/intercept/slope, suppress its plot
+qq_pdf <- tempfile(fileext = ".pdf"); pdf(qq_pdf); qq_obj <- diagnostic_qqplot(
+  U_vals, alpha = alpha, Cstar = Cstar); dev.off(); unlink(qq_pdf)
+
+qq_df <- data.frame(theoretical = qq_obj$theoretical,
+                    observed    = qq_obj$observed,
+                    lower       = qq_obj$lower,
+                    upper       = qq_obj$upper)
+
+p_qq <- ggplot(qq_df, aes(x = theoretical)) +
+  geom_line(aes(y = lower), color = "grey50", linetype = "dashed", linewidth = 0.6) +
+  geom_line(aes(y = upper), color = "grey50", linetype = "dashed", linewidth = 0.6) +
+  geom_abline(intercept = qq_obj$intercept, slope = qq_obj$slope,
+              color = "#D62728", linewidth = 0.9) +
+  geom_point(aes(y = observed), color = "#1F77B4", size = 1.8) +
+  labs(x = "Uniform(0, 1) quantiles",
+       y = expression(paste("Sorted ", U[(i)])),
+       title = "(b) Q-Q diagnostic") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0, face = "plain", size = 14),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "grey30"),
+        axis.ticks = element_line(color = "grey30"))
+
+diag_fig <- p_cal + p_qq + patchwork::plot_layout(widths = c(1, 1))
+
+# Save and show
+ggsave("rpcb_diagnostic.png", diag_fig, width = 12, height = 5, dpi = 300)
+print(diag_fig)
 
 cat("Integrated C* (alpha =", alpha, "):", round(Cstar, 4), "\n")
 cat("Minimized objective:", round(Cfit$objective, 6), "\n")
+cat(sprintf("QQ OLS: intercept = %.4f, slope = %.4f\n", qq_obj$intercept, qq_obj$slope))
+cat(sprintf("Candidates outside 95%% simultaneous band: %d / %d\n",
+            length(qq_obj$outside), length(U_vals)))
 ```
 
 Compute f, U diagnostic, and flag Type I candidates using integrated C*
